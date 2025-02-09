@@ -1,34 +1,8 @@
-use keyberon::layout::{Layout, Event};
-use keyberon::matrix::Matrix;
+use rdev::{listen, Event, EventType, Key, simulate, SimulateError};
+use std::time::{Duration, Instant};
+use std::process::Command;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
-use x11rb::protocol::Event as X11Event;
-use std::time::Duration;
-use std::time::Instant;
-use embedded_hal::digital::v2::{InputPin, OutputPin};
-
-mod layout;
-use crate::layout::LAYERS;
-
-// Define pin types for the matrix
-#[derive(Copy, Clone)]
-pub struct InputPins;
-
-#[derive(Copy, Clone)]
-pub struct OutputPins;
-
-// Implement required traits for the pins
-impl InputPin for InputPins {
-    type Error = ();
-    fn is_high(&self) -> Result<bool, Self::Error> { Ok(false) }
-    fn is_low(&self) -> Result<bool, Self::Error> { Ok(true) }
-}
-
-impl OutputPin for OutputPins {
-    type Error = ();
-    fn set_high(&mut self) -> Result<(), Self::Error> { Ok(()) }
-    fn set_low(&mut self) -> Result<(), Self::Error> { Ok(()) }
-}
 
 struct WindowInfo {
     title: String,
@@ -91,102 +65,73 @@ impl WindowInfo {
     }
 }
 
-// Custom matrix implementation for software simulation
-struct KeyboardMatrix {
-    state: [[bool; 12]; 4],
+fn send_key(key: Key) -> Result<(), SimulateError> {
+    simulate(&EventType::KeyPress(key))?;
+    std::thread::sleep(Duration::from_millis(20));
+    simulate(&EventType::KeyRelease(key))?;
+    Ok(())
 }
 
-impl KeyboardMatrix {
-    fn new() -> Self {
-        Self {
-            state: [[false; 12]; 4],
-        }
-    }
-
-    fn get_events(&mut self) -> Vec<Event> {
-        // Simulate key events here
-        Vec::new()
+fn send_media_command(cmd: &str) {
+    match cmd {
+        "vol_up" => { Command::new("pactl").args(["set-sink-volume", "@DEFAULT_SINK@", "+5%"]).spawn().ok(); }
+        "vol_down" => { Command::new("pactl").args(["set-sink-volume", "@DEFAULT_SINK@", "-5%"]).spawn().ok(); }
+        "vol_mute" => { Command::new("pactl").args(["set-sink-mute", "@DEFAULT_SINK@", "toggle"]).spawn().ok(); }
+        "play_pause" => { Command::new("playerctl").arg("play-pause").spawn().ok(); }
+        _ => {}
     }
 }
 
-struct Keyboard {
-    layout: Layout,
-    matrix: KeyboardMatrix,
-    window_info: Option<WindowInfo>,
-    last_update: Instant,
-}
+fn handle_event(event: Event) {
+    // Get active window info
+    let window_info = WindowInfo::get_active_window();
+    
+    // Check if we should disable remapping for the current window
+    let should_disable_remapping = if let Some(window_info) = &window_info {
+        window_info.class.contains("terminal")
+            || window_info.title.contains("vim")
+            || window_info.title.contains("code")
+            || window_info.title.contains("emacs")
+    } else {
+        false
+    };
 
-impl Keyboard {
-    fn new() -> Self {
-        Self {
-            layout: Layout::new(&LAYERS),
-            matrix: KeyboardMatrix::new(),
-            window_info: None,
-            last_update: Instant::now(),
-        }
+    if should_disable_remapping {
+        return;
     }
 
-    fn update(&mut self) {
-        // Update window info every second
-        if self.last_update.elapsed() > Duration::from_secs(1) {
-            self.window_info = WindowInfo::get_active_window();
-            self.last_update = Instant::now();
-        }
-
-        // Process matrix events
-        for event in self.matrix.get_events() {
-            if let Some(window_info) = &self.window_info {
-                // Disable remapping for specific applications
-                let should_disable_remapping = window_info.class.contains("terminal")
-                    || window_info.title.contains("vim")
-                    || window_info.title.contains("code")
-                    || window_info.title.contains("emacs");
-
-                match event {
-                    Event::Press(row, col) => {
-                        if !should_disable_remapping && layout::is_remappable_key(row, col) {
-                            // Apply our custom mapping
-                            self.layout.event(Event::Press(row, col));
-                            let remapped_action = layout::get_remapped_action(row, col);
-                            self.layout.event(Event::Press(row, col));
-                        } else {
-                            // Process normally
-                            self.layout.event(event);
-                        }
-                    }
-                    Event::Release(row, col) => {
-                        if !should_disable_remapping && layout::is_remappable_key(row, col) {
-                            // Release both original and remapped key
-                            self.layout.event(Event::Release(row, col));
-                            let remapped_action = layout::get_remapped_action(row, col);
-                            self.layout.event(Event::Release(row, col));
-                        } else {
-                            // Process normally
-                            self.layout.event(event);
-                        }
-                    }
-                }
-            } else {
-                // Fallback if window info isn't available
-                self.layout.event(event);
+    match event.event_type {
+        EventType::KeyPress(key) => {
+            match key {
+                // WASD to Arrow keys
+                Key::KeyW => { let _ = send_key(Key::UpArrow); }
+                Key::KeyA => { let _ = send_key(Key::LeftArrow); }
+                Key::KeyS => { let _ = send_key(Key::DownArrow); }
+                Key::KeyD => { let _ = send_key(Key::RightArrow); }
+                
+                // Numpad to Volume controls
+                Key::KpPlus => send_media_command("vol_up"),
+                Key::KpMinus => send_media_command("vol_down"),
+                Key::KpDivide => send_media_command("vol_mute"),
+                
+                // Play/Pause key
+                Key::F6 => send_media_command("play_pause"),
+                
+                _ => {}
             }
         }
-
-        self.layout.tick();
-    }
-
-    fn get_report(&mut self) -> keyberon::key_code::KbHidReport {
-        self.layout.keycodes().collect()
+        _ => {}
     }
 }
 
 fn main() {
-    let mut keyboard = Keyboard::new();
+    println!("Starting key remapper...");
+    println!("WASD -> Arrow keys");
+    println!("Numpad +/- -> Volume Up/Down");
+    println!("Numpad / -> Volume Mute");
+    println!("F6 -> Play/Pause");
     
-    loop {
-        keyboard.update();
-        
-        // Add appropriate delay to prevent high CPU usage
-        std::thread::sleep(Duration::from_millis(1));
+    if let Err(error) = listen(handle_event) {
+        println!("Error: {:?}", error);
     }
 }
